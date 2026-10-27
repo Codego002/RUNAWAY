@@ -9,6 +9,7 @@ import threading
 import os
 import socket
 import sys
+import shutil
 from pathlib import Path
 import queue
 import config
@@ -37,8 +38,9 @@ class ScannerGUI:
     def __init__(self):
         """Initialize scanner GUI"""
         self.root = ctk.CTk()
-        self.root.title("🎬 Runway ML Scanner")
-        self.root.geometry("900x650")
+        self.root.title("Runway Scanner")
+        self.root.geometry("640x420")
+        self.root.minsize(560, 340)
         
         # Scanner state
         self.scanner_process = None
@@ -61,165 +63,111 @@ class ScannerGUI:
         self.check_auth_status()
     
     def build_ui(self):
-        """Build the interface"""
-        
-        # ============ TOP BAR ============
-        top_frame = ctk.CTkFrame(self.root)
-        top_frame.pack(fill="x", padx=10, pady=10)
-        
-        # Title
-        ctk.CTkLabel(
-            top_frame,
-            text="🎬 Runway ML Scanner",
-            font=("Arial", 18, "bold")
-        ).pack(side="left", padx=10)
-        
-        # IP Display
+        """Compact tool layout: toolbar + proxy row + logs."""
+        pad = {"padx": 8, "pady": 6}
+        btn = {"height": 28, "corner_radius": 6, "font": ctk.CTkFont(size=12)}
         local_ip = get_local_ip()
+
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(3, weight=1)
+
+        top = ctk.CTkFrame(self.root, corner_radius=8, height=40)
+        top.grid(row=0, column=0, sticky="ew", **pad)
+        top.grid_columnconfigure(2, weight=1)
+
         ctk.CTkLabel(
-            top_frame,
-            text=f"📡 IP: {local_ip}:8080",
-            font=("Arial", 12),
-            text_color="cyan"
-        ).pack(side="left", padx=20)
-        
-        # Status
+            top, text="Scanner",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).grid(row=0, column=0, padx=(10, 8), pady=6)
+
+        ctk.CTkLabel(
+            top, text=f"{local_ip}:8080",
+            font=ctk.CTkFont(size=12),
+            text_color="#4DD0E1"
+        ).grid(row=0, column=1, padx=4, pady=6)
+
         self.status_label = ctk.CTkLabel(
-            top_frame,
-            text="● Stopped",
-            font=("Arial", 14),
-            text_color="red"
+            top, text="● Stopped",
+            font=ctk.CTkFont(size=12),
+            text_color="#EF5350"
         )
-        self.status_label.pack(side="left", padx=20)
-        
-        # Buttons
-        self.start_btn = ctk.CTkButton(
-            top_frame,
-            text="▶️  Start",
-            command=self.start_scanner,
-            width=100,
-            height=35,
-            fg_color="green"
-        )
-        self.start_btn.pack(side="right", padx=5)
-        
+        self.status_label.grid(row=0, column=2, sticky="w", padx=8, pady=6)
+
         self.stop_btn = ctk.CTkButton(
-            top_frame,
-            text="⏹️  Stop",
-            command=self.stop_scanner,
-            width=100,
-            height=35,
-            state="disabled",
-            fg_color="red"
+            top, text="Stop", command=self.stop_scanner,
+            width=72, state="disabled",
+            fg_color="#C62828", hover_color="#8E0000", **btn
         )
-        self.stop_btn.pack(side="right", padx=5)
-        
-        # ============ PROXY CONFIG ============
-        proxy_frame = ctk.CTkFrame(self.root)
-        proxy_frame.pack(fill="x", padx=10, pady=5)
-        
-        ctk.CTkLabel(
-            proxy_frame,
-            text="🌐 Proxy:",
-            font=("Arial", 12, "bold")
-        ).pack(side="left", padx=10)
-        
-        # Proxy checkbox
+        self.stop_btn.grid(row=0, column=3, padx=4, pady=6)
+
+        self.start_btn = ctk.CTkButton(
+            top, text="Start", command=self.start_scanner,
+            width=72, fg_color="#2E7D32", hover_color="#1B5E20", **btn
+        )
+        self.start_btn.grid(row=0, column=4, padx=(4, 10), pady=6)
+
+        proxy = ctk.CTkFrame(self.root, corner_radius=8)
+        proxy.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
+        proxy.grid_columnconfigure(1, weight=1)
+
         self.use_proxy_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            proxy_frame,
-            text="Enable",
-            variable=self.use_proxy_var
-        ).pack(side="left", padx=5)
-        
-        # Proxy URL
-        ctk.CTkLabel(proxy_frame, text="URL:").pack(side="left", padx=5)
-        self.proxy_url = ctk.CTkEntry(proxy_frame, width=150, placeholder_text="proxy.example.com")
-        self.proxy_url.pack(side="left", padx=2)
-        
-        # Proxy Port
-        ctk.CTkLabel(proxy_frame, text="Port:").pack(side="left", padx=5)
-        self.proxy_port = ctk.CTkEntry(proxy_frame, width=50, placeholder_text="8080")
-        self.proxy_port.pack(side="left", padx=2)
-        
-        # Proxy Auth
-        ctk.CTkLabel(proxy_frame, text="Auth:").pack(side="left", padx=5)
-        self.proxy_auth = ctk.CTkEntry(proxy_frame, width=120, placeholder_text="user:pass")
-        self.proxy_auth.pack(side="left", padx=2)
-        
-        # Save button
+        ctk.CTkSwitch(
+            proxy, text="Proxy", variable=self.use_proxy_var,
+            width=42, height=22, font=ctk.CTkFont(size=12)
+        ).grid(row=0, column=0, padx=(10, 8), pady=6)
+
+        self.proxy_url = ctk.CTkEntry(
+            proxy, placeholder_text="host", height=28, width=160
+        )
+        self.proxy_url.grid(row=0, column=1, padx=3, pady=6, sticky="ew")
+
+        self.proxy_port = ctk.CTkEntry(
+            proxy, placeholder_text="port", height=28, width=58
+        )
+        self.proxy_port.grid(row=0, column=2, padx=3, pady=6)
+
+        self.proxy_auth = ctk.CTkEntry(
+            proxy, placeholder_text="user:pass", height=28, width=120
+        )
+        self.proxy_auth.grid(row=0, column=3, padx=3, pady=6)
+
         ctk.CTkButton(
-            proxy_frame,
-            text="💾",
-            width=30,
-            command=self.save_proxy_config
-        ).pack(side="left", padx=5)
-        
-        # ============ INFO ============
-        info_frame = ctk.CTkFrame(self.root)
-        info_frame.pack(fill="x", padx=10, pady=5)
-        
-        info_label = ctk.CTkLabel(
-            info_frame,
-            text=f"📁 Output: {config.AUTH_FILE}",
-            font=("Arial", 11)
-        )
-        info_label.pack(pady=5)
-        
-        # Auth status
+            proxy, text="Save", command=self.save_proxy_config,
+            width=56, **btn
+        ).grid(row=0, column=4, padx=(3, 10), pady=6)
+
+        meta = ctk.CTkFrame(self.root, corner_radius=8, fg_color="transparent")
+        meta.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 4))
+        meta.grid_columnconfigure(1, weight=1)
+
         self.auth_status = ctk.CTkLabel(
-            info_frame,
-            text="Auth: Not captured yet",
-            font=("Arial", 11)
+            meta, text="Auth: none",
+            font=ctk.CTkFont(size=11),
+            anchor="w"
         )
-        self.auth_status.pack(pady=5)
-        
-        # ============ INSTRUCTIONS ============
-        instructions_frame = ctk.CTkFrame(self.root)
-        instructions_frame.pack(fill="x", padx=10, pady=5)
-        
-        instructions = f"""
-📝 Instructions:
-1. (Optional) Proxy: URL + Port + Auth → Click 💾
-2. Click "▶️ Start" → Proxy: {get_local_ip()}:8080
-3. Configure browser proxy → {get_local_ip()}:8080
-4. Open Runway ML → Auth captured automatically
-5. Click "⏹️ Stop" → Done!
-        """
-        
+        self.auth_status.grid(row=0, column=0, sticky="w")
+
         ctk.CTkLabel(
-            instructions_frame,
-            text=instructions,
-            font=("Arial", 11),
-            justify="left"
-        ).pack(padx=10, pady=10)
-        
-        # ============ LOGS ============
-        logs_label = ctk.CTkLabel(
-            self.root,
-            text="📋 Real-time Logs:",
-            font=("Arial", 12, "bold")
-        )
-        logs_label.pack(anchor="w", padx=10, pady=(10, 5))
-        
-        # Log textbox
+            meta, text=str(config.AUTH_FILE),
+            font=ctk.CTkFont(size=11),
+            text_color="gray70",
+            anchor="w"
+        ).grid(row=0, column=1, sticky="ew", padx=8)
+
+        ctk.CTkButton(
+            meta, text="Clear", command=self.clear_logs,
+            width=56, fg_color="transparent", border_width=1, **btn
+        ).grid(row=0, column=2, sticky="e")
+
         self.log_text = ctk.CTkTextbox(
             self.root,
-            font=("Consolas", 10),
-            wrap="word"
+            font=ctk.CTkFont(family="Consolas", size=11),
+            wrap="word",
+            corner_radius=8
         )
-        self.log_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        
-        # Clear button
-        clear_frame = ctk.CTkFrame(self.root)
-        clear_frame.pack(fill="x", padx=10, pady=(0, 10))
-        
-        ctk.CTkButton(
-            clear_frame,
-            text="🗑️  Clear Logs",
-            command=self.clear_logs,
-            width=120
-        ).pack(side="right")
+        self.log_text.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 8))
+
+        self.add_log(f"Listen {local_ip}:8080  →  mitm.it  →  Runway")
     
     def check_auth_status(self):
         """Check if auth file exists and import accounts"""
@@ -228,8 +176,8 @@ class ScannerGUI:
             
         if config.AUTH_FILE.exists():
             self.auth_status.configure(
-                text="Auth: ✅ Found",
-                text_color="green"
+                text="Auth: found",
+                text_color="#66BB6A"
             )
             # Auto-import accounts from captured auth file
             try:
@@ -240,8 +188,8 @@ class ScannerGUI:
                 print(f"⚠️ Account import error: {e}")
         else:
             self.auth_status.configure(
-                text="Auth: ❌ Not found - Start scanner",
-                text_color="red"
+                text="Auth: none",
+                text_color="#EF5350"
             )
     
     def load_proxy_config(self):
@@ -271,27 +219,75 @@ class ScannerGUI:
     
     def find_mitmdump(self):
         """Find mitmdump executable"""
-        paths = [
-            "mitmdump",
-            "mitmdump.exe",
+        def is_working_mitmdump(path):
+            """Return True if the candidate can execute mitmdump."""
+            if not path:
+                return False
+
+            try:
+                result = subprocess.run(
+                    [path, "--version"],
+                    capture_output=True,
+                    timeout=3,
+                    text=True
+                )
+                output = f"{result.stdout}\n{result.stderr}".lower()
+                return result.returncode == 0 and "mitmproxy" in output
+            except Exception:
+                return False
+
+        candidates = []
+
+        # 1) PATH lookup
+        for name in ["mitmdump", "mitmdump.exe"]:
+            found = shutil.which(name)
+            if found:
+                candidates.append(found)
+
+        # 2) Windows lookup
+        try:
+            where_result = subprocess.run(
+                ["where.exe", "mitmdump"],
+                capture_output=True,
+                timeout=3,
+                text=True
+            )
+            if where_result.returncode == 0:
+                for line in where_result.stdout.splitlines():
+                    line = line.strip()
+                    if line:
+                        candidates.append(line)
+        except Exception:
+            pass
+
+        # 3) Common local locations
+        local_appdata = os.environ.get("LOCALAPPDATA", "")
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        user_profile = os.environ.get("USERPROFILE", "")
+        python_versions = ["Python313", "Python312", "Python311", "Python310", "Python39"]
+
+        candidates.extend([
             os.path.join(os.getcwd(), "mitmdump.exe"),
-            r"C:\Python311\Scripts\mitmdump.exe",
-            r"C:\Python310\Scripts\mitmdump.exe",
-            r"C:\Python39\Scripts\mitmdump.exe"
-        ]
-        
-        for path in paths:
-            if path in ["mitmdump", "mitmdump.exe"]:
-                try:
-                    subprocess.run([path, "--version"], 
-                                 capture_output=True, 
-                                 timeout=2)
-                    return path
-                except:
-                    continue
-            elif os.path.exists(path):
+            os.path.join(program_files, "mitmproxy", "bin", "mitmdump.exe"),
+        ])
+
+        for version in python_versions:
+            candidates.extend([
+                os.path.join(local_appdata, "Programs", "Python", version, "Scripts", "mitmdump.exe"),
+                os.path.join(user_profile, "AppData", "Local", "Programs", "Python", version, "Scripts", "mitmdump.exe"),
+                os.path.join(r"C:\\", version, "Scripts", "mitmdump.exe"),
+            ])
+
+        seen = set()
+        for path in candidates:
+            normalized = os.path.normcase(path)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+
+            if os.path.exists(path) and is_working_mitmdump(path):
                 return path
-        
+
         return None
     
     def start_scanner(self):

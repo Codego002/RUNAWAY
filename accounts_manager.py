@@ -5,6 +5,7 @@ Structure: accounts.json groupé par team_id
 import json
 import re
 import os
+import base64
 from datetime import datetime
 from pathlib import Path
 import config
@@ -25,6 +26,30 @@ def save_accounts(data: dict):
     """Sauvegarde le fichier accounts.json"""
     with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def decode_jwt_payload(auth_header: str) -> dict:
+    """Décode le payload d'un JWT Bearer sans vérifier la signature."""
+    if not auth_header or "Bearer " not in auth_header:
+        return {}
+
+    token = auth_header.replace("Bearer ", "", 1).strip()
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+
+    payload = parts[1]
+    padding = "=" * (-len(payload) % 4)
+
+    try:
+        decoded = base64.urlsafe_b64decode(payload + padding)
+        data = json.loads(decoded.decode("utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    return {}
 
 
 def parse_requests_to_accounts(requests_list: list) -> dict:
@@ -75,6 +100,8 @@ def parse_requests_to_accounts(requests_list: list) -> dict:
                 "team_id": team_id,
                 "label": f"Account {team_id}",
                 "email": "",
+                "first_name": "",
+                "last_name": "",
                 "authorization": auth,
                 "asset_group_id": None,
                 "session_id": None,
@@ -87,6 +114,14 @@ def parse_requests_to_accounts(requests_list: list) -> dict:
             accounts[team_key]["captured_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         acc = accounts[team_key]
+
+        # Fallback: l'email est souvent présent dans le JWT, même sans /v1/profile
+        if not acc["email"]:
+            jwt_payload = decode_jwt_payload(auth)
+            jwt_email = jwt_payload.get("email")
+            if jwt_email:
+                acc["email"] = jwt_email
+                acc["label"] = jwt_email
 
         # Asset Group ID
         if 'assetGroupId' in body and not acc["asset_group_id"]:
@@ -115,8 +150,12 @@ def parse_requests_to_accounts(requests_list: list) -> dict:
                     acc["email"] = user['email']
                     first = user.get('firstName', '')
                     last = user.get('lastName', '')
+                    acc["first_name"] = first
+                    acc["last_name"] = last
                     if first or last:
                         acc["label"] = f"{first} {last}".strip() + f" ({user['email']})"
+                    else:
+                        acc["label"] = user['email']
 
     return accounts
 

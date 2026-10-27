@@ -12,7 +12,7 @@ import subprocess
 import platform
 import random
 from pathlib import Path
-from runway_ai_modifier import RunwayAIModifier
+from runway_ai_modifier import IMAGE_MODELS, RunwayAIModifier, model_by_label
 from cache_manager import RunwayCache
 import requests
 import config
@@ -31,14 +31,16 @@ class RunwayGUI:
         """Initialize GUI"""
         self.root = ctk.CTk()
         self.root.title("🎬 Runway ML Batch Processor V2")
-        self.root.geometry("1000x750")
+        self.root.geometry("1000x820")
         
         # Core components
         self.cache = RunwayCache()
         self.modifier = RunwayAIModifier()
         
-        # Queue
+        # Queue and shared reference images (IMG_2, IMG_3, ... on every task)
         self.queue = []
+        self.shared_refs = []
+        self._cost_seq = 0
         self.processing = False
         self.paused = False
         self.current_index = 0
@@ -167,7 +169,14 @@ class RunwayGUI:
             placeholder_text="Enter your AI prompt here...",
             width=500
         )
-        self.prompt_entry.grid(row=0, column=1, columnspan=3, padx=5, pady=5, sticky="ew")
+        self.prompt_entry.grid(row=0, column=1, columnspan=2, padx=5, pady=5, sticky="ew")
+
+        ctk.CTkButton(
+            settings_frame,
+            text="History",
+            width=80,
+            command=self.show_prompt_history
+        ).grid(row=0, column=3, padx=5, pady=5)
         
         # Ratio
         ctk.CTkLabel(settings_frame, text="Ratio:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
@@ -176,21 +185,42 @@ class RunwayGUI:
             settings_frame,
             variable=self.ratio_var,
             values=["1:1", "9:16", "16:9", "4:3", "3:4"],
-            width=100
+            width=100,
+            command=self.schedule_cost_refresh
         )
         ratio_menu.grid(row=1, column=1, padx=5, pady=5, sticky="w")
         
         # Model
         ctk.CTkLabel(settings_frame, text="Model:").grid(row=1, column=2, padx=5, pady=5, sticky="w")
-        self.model_var = ctk.StringVar(value="gemini_image")
+        self.model_var = ctk.StringVar(value=IMAGE_MODELS[0]["label"])
         model_menu = ctk.CTkOptionMenu(
             settings_frame,
             variable=self.model_var,
-            values=["gemini_image", "ref_image_to_image", "ref_image_to_image_turbo"],
-            width=200
+            values=[model["label"] for model in IMAGE_MODELS],
+            width=200,
+            command=self.schedule_cost_refresh
         )
         model_menu.grid(row=1, column=3, padx=5, pady=5, sticky="w")
-        
+
+        self.cost_label = ctk.CTkLabel(settings_frame, text="Coût: --", font=("Arial", 12, "bold"))
+        self.cost_label.grid(row=1, column=4, padx=8, pady=5, sticky="w")
+
+        ctk.CTkLabel(settings_frame, text="Mode:").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        self.job_mode_var = ctk.StringVar(value="Batch")
+        ctk.CTkOptionMenu(
+            settings_frame,
+            variable=self.job_mode_var,
+            values=["Batch", "Références"],
+            width=140,
+            command=self.on_job_mode_changed
+        ).grid(row=2, column=1, padx=5, pady=5, sticky="w")
+        self.mode_hint = ctk.CTkLabel(
+            settings_frame,
+            text="1 tâche par image. Les réf. partagées s'ajoutent en IMG_2, IMG_3…",
+            text_color="gray",
+        )
+        self.mode_hint.grid(row=2, column=2, columnspan=3, padx=5, pady=5, sticky="w")
+
         # Cache checkbox
         self.use_cache_var = ctk.BooleanVar(value=True)
         cache_check = ctk.CTkCheckBox(
@@ -198,8 +228,8 @@ class RunwayGUI:
             text="✓ Use cached uploads",
             variable=self.use_cache_var
         )
-        cache_check.grid(row=2, column=0, padx=5, pady=5, sticky="w")
-        
+        cache_check.grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky="w")
+
         # Auto-download checkbox
         self.auto_download_var = ctk.BooleanVar(value=True)
         download_check = ctk.CTkCheckBox(
@@ -207,7 +237,22 @@ class RunwayGUI:
             text="✓ Auto-download results",
             variable=self.auto_download_var
         )
-        download_check.grid(row=3, column=0, padx=5, pady=5, sticky="w")
+        download_check.grid(row=3, column=2, columnspan=2, padx=5, pady=5, sticky="w")
+
+        self.refs_label = ctk.CTkLabel(settings_frame, text="Réf. partagées: aucune", anchor="w")
+        self.refs_label.grid(row=4, column=0, columnspan=2, padx=5, pady=5, sticky="w")
+        ctk.CTkButton(
+            settings_frame,
+            text="Ajouter réf.",
+            width=110,
+            command=self.add_shared_refs
+        ).grid(row=4, column=2, padx=5, pady=5, sticky="w")
+        ctk.CTkButton(
+            settings_frame,
+            text="Vider réf.",
+            width=100,
+            command=self.clear_shared_refs
+        ).grid(row=4, column=3, padx=5, pady=5, sticky="w")
         
         settings_frame.columnconfigure(1, weight=1)
         
@@ -454,6 +499,8 @@ class RunwayGUI:
             'from_cache': True
         })
         self.update_queue_display()
+        self.update_refs_label()
+        self.schedule_cost_refresh()
         messagebox.showinfo("Added", f"Added {os.path.basename(item['file_path'])} to queue from cache!")
     
     def remove_from_cache(self, item):
@@ -572,17 +619,19 @@ class RunwayGUI:
         response.encoding = 'utf-8'
         
         if response.status_code == 200:
-            # Remove account from accounts.json
             if self.modifier.team_id:
                 accounts_manager.remove_account(str(self.modifier.team_id))
-                self.refresh_accounts_dropdown()
-            
-            messagebox.showinfo(
-                "Success",
-                "Account deleted successfully!\n\n"
-                "The application will now close."
-            )
-            self.root.quit()
+            messagebox.showinfo("Success", "Account deleted successfully!")
+            self.refresh_accounts_dropdown()
+            # Charger le prochain compte disponible
+            next_account = accounts_manager.get_active_account()
+            if next_account:
+                self.modifier.load_account_data(next_account)
+                self.auth_label.configure(text="Auth: OK", text_color="green")
+                threading.Thread(target=self.refresh_credits, daemon=True).start()
+            else:
+                self.auth_label.configure(text="Auth: No accounts", text_color="red")
+                self.credits_label.configure(text="Credits: --")
         else:
             try:
                 err_text = response.text
@@ -590,6 +639,61 @@ class RunwayGUI:
                 err_text = f"HTTP {response.status_code}"
             raise Exception(f"Delete failed: {response.status_code} - {err_text}")
     
+    def save_prompt_history(self, prompt: str):
+        """Sauvegarde un prompt dans l'historique (max 50 entrees)"""
+        prompt = prompt.strip()
+        if not prompt:
+            return
+        try:
+            history = []
+            if config.PROMPT_HISTORY.exists():
+                with open(config.PROMPT_HISTORY, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+            if prompt in history:
+                history.remove(prompt)
+            history.insert(0, prompt)
+            history = history[:50]
+            with open(config.PROMPT_HISTORY, 'w', encoding='utf-8') as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def show_prompt_history(self):
+        """Affiche la fenetre d'historique des prompts"""
+        try:
+            history = []
+            if config.PROMPT_HISTORY.exists():
+                with open(config.PROMPT_HISTORY, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+        except Exception:
+            history = []
+
+        if not history:
+            messagebox.showinfo("History", "No prompt history yet.")
+            return
+
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Prompt History")
+        dialog.geometry("600x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="Select a prompt to reuse:", font=("Arial", 12, "bold")).pack(pady=10)
+
+        frame = ctk.CTkScrollableFrame(dialog)
+        frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        def select_prompt(p):
+            self.prompt_entry.delete(0, "end")
+            self.prompt_entry.insert(0, p)
+            dialog.destroy()
+
+        for p in history:
+            row = ctk.CTkFrame(frame)
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(row, text=p, wraplength=480, anchor="w", justify="left").pack(side="left", padx=8, fill="x", expand=True)
+            ctk.CTkButton(row, text="Use", width=60, command=lambda x=p: select_prompt(x)).pack(side="right", padx=5)
+
     def add_from_cache(self):
         """Add multiple items from cache to queue"""
         # Show cache selection dialog
@@ -646,8 +750,8 @@ class RunwayGUI:
     
     def load_auth(self):
         """Load auth - try accounts.json first, fallback to old auth file"""
-        # First: try to import old auth file if accounts.json doesn't exist
-        if not accounts_manager.ACCOUNTS_FILE.exists() and config.AUTH_FILE.exists():
+        # Always refresh from the latest captured auth file when available
+        if config.AUTH_FILE.exists():
             accounts_manager.import_from_old_auth_file(str(config.AUTH_FILE))
         
         # Load accounts into dropdown
@@ -661,6 +765,7 @@ class RunwayGUI:
                 label = account.get("label", f"Account {account.get('team_id')}")
                 self.auth_label.configure(text="Auth: ✅", text_color="green")
                 self.refresh_credits()
+                self.schedule_cost_refresh()
                 return
         
         # Fallback: try old auth file directly
@@ -669,9 +774,11 @@ class RunwayGUI:
             if success:
                 self.auth_label.configure(text="Auth: ✅", text_color="green")
                 self.refresh_credits()
+                self.schedule_cost_refresh()
                 return
         
         self.auth_label.configure(text="Auth: ❌ No accounts", text_color="red")
+        self.schedule_cost_refresh()
     
     def refresh_accounts_dropdown(self):
         """Refresh the accounts dropdown with current accounts"""
@@ -718,6 +825,7 @@ class RunwayGUI:
                 self.auth_label.configure(text="Auth: ✅", text_color="green")
                 # Refresh credits in background
                 threading.Thread(target=self.refresh_credits, daemon=True).start()
+                self.schedule_cost_refresh()
                 print(f"🔄 Switched to account: {account.get('label')}")
             else:
                 self.auth_label.configure(text="Auth: ❌ Failed", text_color="red")
@@ -726,10 +834,26 @@ class RunwayGUI:
         """Refresh credits display (Runway accurate balance)"""
         try:
             credits = None
-            # 1️⃣ Récupérer le team_id depuis le profile
+            # 1. Recuperer le team_id depuis le profile
             profile_resp = self.modifier.session.get(
                 f"{self.modifier.base_url}/v1/profile"
             )
+            if profile_resp.status_code == 401:
+                # Token expiré - supprimer ce compte
+                active = accounts_manager.get_active_account()
+                if active:
+                    accounts_manager.remove_account(str(active["team_id"]))
+                    print(f"Compte supprime (401): {active.get('label')}")
+                self.root.after(0, self.refresh_accounts_dropdown)
+                next_account = accounts_manager.get_active_account()
+                if next_account:
+                    self.modifier.load_account_data(next_account)
+                    self.root.after(0, lambda: self.auth_label.configure(text="Auth: OK", text_color="green"))
+                    threading.Thread(target=self.refresh_credits, daemon=True).start()
+                else:
+                    self.root.after(0, lambda: self.auth_label.configure(text="Auth: No accounts", text_color="red"))
+                    self.root.after(0, lambda: self.credits_label.configure(text="Credits: --"))
+                return
             if profile_resp.status_code != 200:
                 raise Exception("Profile fetch failed")
             profile_data = profile_resp.json()
@@ -737,26 +861,59 @@ class RunwayGUI:
             team_id = user.get("id")
             if not team_id:
                 raise Exception("Team ID introuvable")
-            # 2️⃣ Crédit réel AVEC asTeamId
-            usage_resp = self.modifier.session.get(
-                f"{self.modifier.base_url}/v1/billing/credits_usages",
+
+            # Mettre a jour nom/email dans accounts.json et le dropdown
+            first = user.get("firstName", "")
+            last  = user.get("lastName", "")
+            email = user.get("email", "")
+            account = accounts_manager.get_account(str(team_id))
+            if account:
+                account["first_name"] = first
+                account["last_name"]  = last
+                account["email"]      = email
+                if first or last:
+                    account["label"] = f"{first} {last}".strip() + f" ({email})"
+                elif email:
+                    account["label"] = email
+                data = accounts_manager.load_accounts()
+                data["accounts"][str(team_id)] = account
+                accounts_manager.save_accounts(data)
+                self.root.after(0, self.refresh_accounts_dropdown)
+
+            # The app total is monthly remaining + purchased.
+            # Monthly: profile/features permitted.numPlanCredits - used.numPlanCredits
+            # Purchased: profile user.gpuCredits (the number never appears as one field)
+            purchased = user.get("gpuCredits") or 0
+            features_resp = self.modifier.session.get(
+                f"{self.modifier.base_url}/v1/profile/features",
                 params={"asTeamId": team_id}
             )
-            if usage_resp.status_code == 200:
-                usage_data = usage_resp.json()
-                usages = usage_data.get("creditUsages", [])
-                if usages:
-                    credits = usages[0].get("newBalance")
-            # 3️⃣ Fallback (compte neuf)
+            if features_resp.status_code == 200:
+                features = features_resp.json().get("features", {})
+                permitted = features.get("permitted", {}).get("numPlanCredits")
+                used      = features.get("used", {}).get("numPlanCredits", 0)
+                if permitted is not None:
+                    credits = (permitted - used) + purchased
+
+            # Fallback: last plan balance from the usage ledger, plus purchased credits
             if credits is None:
-                credits = user.get("gpuCredits", 0)
-            print(f"✅ Crédit réel: {credits} | Team: {team_id}")
-            # Save cache
+                usage_resp = self.modifier.session.get(
+                    f"{self.modifier.base_url}/v1/billing/credits_usages",
+                    params={"asTeamId": team_id}
+                )
+                if usage_resp.status_code == 200:
+                    usages = usage_resp.json().get("creditUsages", [])
+                    if usages:
+                        credits = int(usages[0].get("newBalance") or 0) + purchased
+
+            if credits is None:
+                credits = purchased
+
+            print(f"Credits: {credits} | Team: {team_id}")
             self.cache.save_profile(team_id, credits)
-            # Update UI
-            self.credits_label.configure(text=f"Credits: {credits} ⚡")
+            self.credits_label.configure(text=f"Credits: {credits}")
         except Exception as e:
-            print(f"❌ Error refreshing credits: {e}")
+            print(f"Error refreshing credits: {e}")
             self.credits_label.configure(text="Credits: --")
     
     def launch_scanner_gui(self):
@@ -775,7 +932,7 @@ class RunwayGUI:
         """Add images to queue"""
         files = filedialog.askopenfilenames(
             title="Select images",
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.webp")]
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.webp *.heic")]
         )
         
         for file in files:
@@ -794,6 +951,8 @@ class RunwayGUI:
             })
         
         self.update_queue_display()
+        self.update_refs_label()
+        self.schedule_cost_refresh()
     
     def update_queue_display(self):
         """Update queue display with status colors"""
@@ -831,14 +990,20 @@ class RunwayGUI:
                 text_color=color
             ).pack(side="left", padx=5)
             
-            # Filename
+            # Filename. In Références mode the row order is the IMG tag order.
             filename = os.path.basename(item['file'])
+            if self.job_mode_var.get() == "Références":
+                tag = f"IMG_{idx + 1}  "
+            elif self.shared_refs:
+                tag = "IMG_1  "
+            else:
+                tag = ""
             cache_tag = " [CACHED]" if item.get('from_cache') else ""
             error_tag = f" - {item.get('error', '')}" if item.get('error') else ""
             
             ctk.CTkLabel(
                 frame, 
-                text=f"{filename}{cache_tag}{error_tag}",
+                text=f"{tag}{filename}{cache_tag}{error_tag}",
                 anchor="w"
             ).pack(side="left", fill="x", expand=True, padx=5)
             
@@ -855,6 +1020,8 @@ class RunwayGUI:
         if not self.processing or index >= self.current_index:
             self.queue.pop(index)
             self.update_queue_display()
+            self.update_refs_label()
+            self.schedule_cost_refresh()
     
     def clear_queue(self):
         """Clear queue"""
@@ -862,7 +1029,34 @@ class RunwayGUI:
             self.queue = []
             self.current_index = 0
             self.update_queue_display()
+            self.update_refs_label()
+            self.schedule_cost_refresh()
     
+    def next_batch_output_dir(self):
+        """Next unused folder: outputs/AA_MM_JJ_A (then B..Z, then AA)."""
+        config.OUTPUTS_DIR.mkdir(exist_ok=True)
+        prefix = time.strftime("%y_%m_%d")
+        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        for ch in letters:
+            candidate = config.OUTPUTS_DIR / f"{prefix}_{ch}"
+            if not candidate.exists():
+                return candidate
+        for ch1 in letters:
+            for ch2 in letters:
+                candidate = config.OUTPUTS_DIR / f"{prefix}_{ch1}{ch2}"
+                if not candidate.exists():
+                    return candidate
+        raise RuntimeError("Too many batches today")
+
+    def prepare_batch_output(self, prompt: str):
+        """Create dated batch folder and write prompt.txt."""
+        batch_dir = self.next_batch_output_dir()
+        batch_dir.mkdir(parents=True, exist_ok=False)
+        (batch_dir / "prompt.txt").write_text(prompt.strip() + "\n", encoding="utf-8")
+        self.output_dir = batch_dir
+        print(f"Batch folder: {batch_dir}")
+        return batch_dir
+
     def start_batch(self):
         """Start batch processing"""
         if not self.queue:
@@ -872,6 +1066,28 @@ class RunwayGUI:
         if not self.prompt_entry.get():
             messagebox.showwarning("No Prompt", "Enter a prompt first!")
             return
+
+        token_problem = self.modifier.uploader.token_error()
+        if token_problem:
+            messagebox.showerror("Auth", token_problem)
+            return
+
+        model = model_by_label(self.model_var.get())
+        grouped = self.job_mode_var.get() == "Références"
+        ref_count = (len(self.queue) + len(self.shared_refs)) if grouped else (1 + len(self.shared_refs))
+        if grouped and ref_count < 2:
+            messagebox.showwarning(
+                "Références",
+                "Le mode Références envoie toutes les images dans une seule tâche.\nAjoute au moins 2 images."
+            )
+            return
+        if model.get("single_ref") and ref_count > 1:
+            if not messagebox.askyesno(
+                model["label"],
+                f"{model['label']} n'accepte qu'une seule image de référence.\n"
+                "Seule IMG_1 sera envoyée. Continuer ?"
+            ):
+                return
         
         # Reset index for new batch
         self.current_index = 0
@@ -883,133 +1099,193 @@ class RunwayGUI:
         self.stop_btn.configure(state="normal")
         
         threading.Thread(target=self.process_batch, daemon=True).start()
-    
+
+    def on_job_mode_changed(self, _value=None):
+        if self.job_mode_var.get() == "Références":
+            self.mode_hint.configure(text="Une seule tâche : la file devient IMG_1, IMG_2, IMG_3…")
+        else:
+            self.mode_hint.configure(text="1 tâche par image. Les réf. partagées s'ajoutent en IMG_2, IMG_3…")
+        self.update_queue_display()
+        self.schedule_cost_refresh()
+
+    def add_shared_refs(self):
+        """Extra images appended to every task as IMG_2, IMG_3, ..."""
+        files = filedialog.askopenfilenames(
+            title="Images de référence",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.webp *.heic")]
+        )
+        for file in files:
+            if any(ref["file"] == file for ref in self.shared_refs):
+                continue
+            self.shared_refs.append({"file": file, "from_cache": False})
+        self.update_queue_display()
+        self.schedule_cost_refresh()
+
+    def clear_shared_refs(self):
+        self.shared_refs = []
+        self.update_queue_display()
+        self.schedule_cost_refresh()
+
+    def update_refs_label(self):
+        count = len(self.shared_refs)
+        if count == 0:
+            text = "Réf. partagées: aucune"
+        else:
+            start = len(self.queue) + 1 if self.job_mode_var.get() == "Références" else 2
+            tags = ", ".join(f"IMG_{start + i}" for i in range(count))
+            names = ", ".join(os.path.basename(ref["file"]) for ref in self.shared_refs)
+            text = f"Réf. partagées: {tags} — {names}"
+        if model_by_label(self.model_var.get()).get("single_ref"):
+            text += "  · ce modèle n'envoie que IMG_1"
+        self.refs_label.configure(text=text)
+
+    def schedule_cost_refresh(self, *_args):
+        self._cost_seq += 1
+        seq = self._cost_seq
+        self.cost_label.configure(text="Coût: …")
+        self.update_refs_label()
+        threading.Thread(target=self._fetch_cost, args=(seq,), daemon=True).start()
+
+    def _fetch_cost(self, seq):
+        model = model_by_label(self.model_var.get())
+        grouped = self.job_mode_var.get() == "Références"
+        cost = None
+        offline = not bool(self.modifier.bearer_token)
+        if not offline:
+            try:
+                estimate = self.modifier.estimate_feature_cost(model["id"], self.ratio_var.get(), 1)
+                cost = estimate.get("cost")
+            except Exception as exc:
+                print(f"Cost estimate failed: {exc}")
+                offline = True
+        if cost is None:
+            cost = model["credits"]
+            offline = True
+        if grouped:
+            text = f"Coût: {cost} cr (1 tâche)"
+        elif len(self.queue) > 1:
+            text = f"Coût: {cost} cr × {len(self.queue)} = {cost * len(self.queue)} cr"
+        else:
+            text = f"Coût: {cost} cr / image"
+        if offline:
+            text = "≈ " + text
+
+        def apply():
+            if seq == self._cost_seq:
+                self.cost_label.configure(text=text)
+
+        self.root.after(0, apply)
+
+    def _asset_for(self, item):
+        """Cached asset, or upload. Returns {assetId, url}."""
+        if item.get("asset_id") and item.get("asset_url"):
+            return {"assetId": item["asset_id"], "url": item["asset_url"]}
+        if self.use_cache_var.get():
+            cached = self.cache.check_cached_upload(item["file"])
+            if cached:
+                return cached
+        return self.upload_and_cache(item["file"])
+
     def process_batch(self):
-        """Process batch with intelligent error handling"""
-        total = len(self.queue)
+        """Process batch with intelligent error handling.
+
+        Batch: one task per queue image, shared refs appended.
+        Références: one task, every queue image is IMG_1, IMG_2, ...
+        """
+        grouped = self.job_mode_var.get() == "Références"
+        jobs = [list(self.queue)] if grouped else [[item] for item in self.queue]
+        total = len(jobs)
         success_count = 0
         failed_count = 0
-        skipped_count = 0
-        
-        # Error log file
-        error_log_path = config.OUTPUTS_DIR / f"errors_{time.strftime('%Y%m%d_%H%M%S')}.log"
-        
-        for idx in range(self.current_index, total):
-            if not self.processing:
-                break
-            
-            while self.paused:
-                time.sleep(0.1)
-            
-            if not self.processing:
-                break
-            
-            item = self.queue[idx]
-            self.current_index = idx
-            filename = os.path.basename(item['file'])
-            
-            # Update progress
-            progress = (idx + 1) / total
-            self.progress_bar.set(progress)
-            self.progress_label.configure(text=f"Processing {idx + 1}/{total}: {filename}")
-            
-            # Mark as processing
-            item['status'] = 'processing'
+
+        self.prepare_batch_output(self.prompt_entry.get())
+        error_log_path = self.output_dir / f"errors_{time.strftime('%Y%m%d_%H%M%S')}.log"
+
+        try:
+            shared_assets = [self._asset_for(ref) for ref in self.shared_refs]
+        except Exception as exc:
+            error_str = str(exc)
+            for item in self.queue:
+                item["status"] = "failed"
+                item["error"] = error_str[:160]
+            with open(error_log_path, "a", encoding="utf-8") as handle:
+                handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] shared refs\n  Error: {error_str}\n\n")
             self.root.after(0, self.update_queue_display)
-            
+            self._finish_batch(0, len(jobs), error_log_path)
+            return
+
+        for idx, group in enumerate(jobs):
+            if not self.processing:
+                break
+            while self.paused and self.processing:
+                time.sleep(0.1)
+            if not self.processing:
+                break
+
+            self.current_index = idx
+            filename = ", ".join(os.path.basename(item["file"]) for item in group)
+            self.progress_bar.set((idx + 1) / total)
+            self.progress_label.configure(text=f"Processing {idx + 1}/{total}: {filename}")
+            for item in group:
+                item["status"] = "processing"
+            self.root.after(0, self.update_queue_display)
+
             try:
-                # 1. Check cache / Upload
-                if self.use_cache_var.get():
-                    cached = self.cache.check_cached_upload(item['file'])
-                    if cached:
-                        asset = cached
-                        print(f"✅ Using cached upload for {filename}")
-                    else:
-                        asset = self.upload_and_cache(item['file'])
-                else:
-                    asset = self.upload_and_cache(item['file'])
-                
-                # 2. Create AI task
-                reference_images = [{
-                    "assetId": asset['assetId'],
-                    "url": asset['url'],
-                    "tag": "IMG_1"
-                }]
-                
-                # Get task type based on model
-                model = self.model_var.get()
-                if model == "ref_image_to_image":
-                    task_type = "ref_image_to_image"
-                    seed = random.randint(1, 999999)
-                elif model == "ref_image_to_image_turbo":
-                    task_type = "ref_image_to_image_turbo"
-                    seed = random.randint(1, 999999)
-                else:
-                    task_type = "gemini_image"
-                    seed = None
-                
+                assets = [self._asset_for(item) for item in group]
+                reference_images = [
+                    {"assetId": asset["assetId"], "url": asset.get("url")}
+                    for asset in assets + shared_assets
+                ]
+                model = model_by_label(self.model_var.get())
+                seed = random.randint(1, 2**32 - 1) if model["family"] == "gen4" else None
                 ai_task = self.modifier.create_ai_task(
                     prompt=self.prompt_entry.get(),
                     reference_images=reference_images,
                     aspect_ratio=self.ratio_var.get(),
                     num_images=1,
-                    task_type=task_type,
-                    seed=seed
+                    task_type=model["id"],
+                    seed=seed,
                 )
-                
                 if not ai_task:
                     raise Exception("Failed to create AI task")
-                
-                # 3. Wait for completion
-                completed_task = self.modifier.wait_for_completion(
-                    ai_task['id'],
-                    max_wait=300
-                )
-                
+                self.save_prompt_history(self.prompt_entry.get())
+
+                completed_task = self.modifier.wait_for_completion(ai_task["id"], max_wait=300)
                 if not completed_task:
                     raise Exception("Task failed or timeout")
-                
-                # Check if task actually failed
-                if completed_task.get('status') == 'FAILED':
-                    error_info = completed_task.get('failure', {})
-                    error_reason = error_info.get('reason', 'Unknown')
-                    error_msg = error_info.get('errorMessage', 'No details')
+                if completed_task.get("status") == "FAILED":
+                    error_info = completed_task.get("failure", {})
+                    error_reason = error_info.get("reason", "Unknown")
+                    error_msg = error_info.get("errorMessage", "No details")
                     raise Exception(f"{error_reason}: {error_msg}")
-                
-                # 4. Get results
+
                 result_urls = self.modifier.get_result_urls(completed_task)
-                
                 if not result_urls:
                     raise Exception("No results generated")
-                
-                # 5. Download if enabled
                 if self.auto_download_var.get():
-                    self.download_results(item['file'], result_urls)
-                
-                # SUCCESS!
-                item['status'] = 'success'
-                item['result_urls'] = result_urls
+                    self.download_results(group[0]["file"], result_urls)
+
+                for item in group:
+                    item["status"] = "success"
+                    item["result_urls"] = result_urls
                 success_count += 1
                 print(f"✅ SUCCESS: {filename}")
-                
-            except Exception as e:
-                # FAILED - but continue with next image!
-                error_str = str(e)
-                item['status'] = 'failed'
-                item['error'] = error_str[:50]  # Truncate for display
+            except Exception as exc:
+                error_str = str(exc)
+                for item in group:
+                    item["status"] = "failed"
+                    item["error"] = error_str[:160]
                 failed_count += 1
-                
-                # Log error to file
-                with open(error_log_path, 'a', encoding='utf-8') as f:
-                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {filename}\n")
-                    f.write(f"  Error: {error_str}\n\n")
-                
+                with open(error_log_path, "a", encoding="utf-8") as handle:
+                    handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {filename}\n")
+                    handle.write(f"  Error: {error_str}\n\n")
                 print(f"❌ FAILED: {filename} - {error_str}")
-                
-                # Continue with next image - DON'T STOP!
-            
-            # Update display
+
             self.root.after(0, self.update_queue_display)
+
+        self._finish_batch(success_count, failed_count, error_log_path)
+
+    def _finish_batch(self, success_count, failed_count, error_log_path):
         
         # BATCH COMPLETE - show summary
         self.processing = False
@@ -1021,6 +1297,7 @@ class RunwayGUI:
         summary = f"Batch Complete!\n\n"
         summary += f"✅ Success: {success_count}\n"
         summary += f"❌ Failed: {failed_count}\n"
+        summary += f"\nFolder: {self.output_dir.name}"
         
         if failed_count > 0:
             summary += f"\nError log saved to:\n{error_log_path.name}"
@@ -1037,7 +1314,8 @@ class RunwayGUI:
         asset = self.modifier.upload_image_for_ai(image_path)
         
         if not asset:
-            raise Exception("Upload failed")
+            detail = getattr(self.modifier.uploader, "last_error", None) or "Upload failed"
+            raise Exception(detail)
         
         # Cache it
         self.cache.save_upload(

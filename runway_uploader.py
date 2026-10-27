@@ -5,6 +5,8 @@ Script d'upload automatisé basé sur l'analyse des requêtes capturées
 import requests
 import json
 import os
+import time
+import base64
 from pathlib import Path
 import mimetypes
 from typing import Optional, Dict, Any, List
@@ -43,6 +45,50 @@ class RunwayUploader:
         
         self.session = requests.Session()
         self.session.headers.update(self.headers)
+        self.team_id = None
+        self.last_error = None
+
+    def token_error(self) -> Optional[str]:
+        """None when the bearer token is still inside its exp window."""
+        auth = self.session.headers.get("Authorization") or self.headers.get("Authorization") or ""
+        if "Bearer " not in auth:
+            return "Pas de token. Lance le Scanner et connecte-toi dans Runway."
+        payload = auth.split(" ", 1)[1].split(".")
+        if len(payload) < 2:
+            return "Token illisible. Relance le Scanner."
+        try:
+            segment = payload[1] + "=" * (-len(payload[1]) % 4)
+            data = json.loads(base64.urlsafe_b64decode(segment))
+        except Exception:
+            return "Token illisible. Relance le Scanner."
+        exp = data.get("exp")
+        if exp and float(exp) < time.time():
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(exp)))
+            return f"Token expiré le {when}. Relance le Scanner et reconnecte le compte."
+        return None
+
+    def _fail(self, message: str) -> None:
+        self.last_error = message
+        print(f"❌ {message}")
+
+    def _apply_team_header(self) -> Optional[int]:
+        team_id = self._team_id()
+        if team_id:
+            self.session.headers["x-runway-workspace"] = str(team_id)
+        return team_id
+
+    def _team_id(self) -> Optional[int]:
+        if getattr(self, "team_id", None):
+            return int(self.team_id)
+        for req in getattr(self, "_captured_requests", []):
+            url = req.get("url", "")
+            if "asTeamId=" not in url:
+                continue
+            import re
+            match = re.search(r"asTeamId=(\d+)", url)
+            if match:
+                return int(match.group(1))
+        return None
     
     def load_auth_from_captured(self, json_file: str) -> bool:
         """
@@ -107,118 +153,85 @@ class RunwayUploader:
             Response JSON ou None
         """
         if not os.path.exists(image_path):
-            print(f"❌ File not found: {image_path}")
+            self._fail(f"Fichier introuvable: {image_path}")
             return None
         
         print(f"\n📤 Uploading: {image_path}")
-        
+        # Kept for callers that upload a single DATASET. auto_upload sends preview + dataset.
+        return self._upload_typed(image_path, "DATASET")
+
+    def _upload_typed(self, image_path: str, upload_type: str) -> Optional[Dict[str, Any]]:
+        """POST /v1/uploads, PUT the bytes to S3, POST /complete. upload_type is DATASET or DATASET_PREVIEW."""
         try:
             filename = os.path.basename(image_path)
             file_size = os.path.getsize(image_path)
-            
-            # Calcule le nombre de parts (5MB par part pour les gros fichiers)
-            part_size = 5 * 1024 * 1024  # 5MB
+            part_size = 5 * 1024 * 1024
             num_parts = max(1, (file_size + part_size - 1) // part_size)
-            
-            # Step 1: Initie l'upload multipart
-            print(f"Step 1: Initiating multipart upload ({num_parts} parts)...")
-            
-            init_payload = {
-                "filename": filename,
-                "numberOfParts": num_parts,
-                "type": "DATASET"  # CRITICAL: Must be "DATASET" not "image"
-            }
-            
+
+            print(f"Step 1: {upload_type} ({num_parts} part(s))...")
+            self._apply_team_header()
             response = self.session.post(
                 f"{self.base_url}/v1/uploads",
-                json=init_payload
+                json={
+                    "filename": filename,
+                    "numberOfParts": num_parts,
+                    "type": upload_type,
+                },
             )
-            
             print(f"Status: {response.status_code}")
-            
-            if response.status_code not in [200, 201]:
-                print(f"❌ Failed to initiate upload: {response.text}")
+            if response.status_code == 401:
+                self._fail("Token refusé (401). Relance le Scanner et reconnecte le compte.")
                 return None
-            
+            if response.status_code not in (200, 201):
+                self._fail(f"Init {upload_type} {response.status_code}: {response.text[:180]}")
+                return None
+
             init_data = response.json()
-            upload_id = init_data.get('id')
-            upload_urls = init_data.get('uploadUrls', [])
-            upload_headers = init_data.get('uploadHeaders', {})
-            
+            upload_id = init_data.get("id")
+            upload_urls = init_data.get("uploadUrls", [])
+            upload_headers = init_data.get("uploadHeaders") or {}
             if not upload_id or not upload_urls:
-                print(f"❌ Invalid response: {init_data}")
+                self._fail(f"Réponse upload invalide: {list(init_data)[:8]}")
                 return None
-            
-            print(f"✅ Upload ID: {upload_id}")
-            print(f"✅ Got {len(upload_urls)} upload URL(s)")
-            
-            # Step 2: Upload chaque part vers S3
-            print(f"Step 2: Uploading {num_parts} part(s) to S3...")
-            
+
             parts = []
-            with open(image_path, 'rb') as f:
-                for i, upload_url in enumerate(upload_urls, 1):
-                    # Lit la part
-                    part_data = f.read(part_size)
+            with open(image_path, "rb") as handle:
+                for index, upload_url in enumerate(upload_urls, 1):
+                    part_data = handle.read(part_size)
                     if not part_data:
                         break
-                    
-                    print(f"  Uploading part {i}/{num_parts} ({len(part_data)} bytes)...")
-                    
-                    # Utilise les headers de la response
-                    s3_headers = upload_headers.copy() if upload_headers else {}
-                    if not s3_headers.get('Content-Type'):
+                    s3_headers = dict(upload_headers)
+                    if not s3_headers.get("Content-Type"):
                         mime_type, _ = mimetypes.guess_type(image_path)
-                        s3_headers['Content-Type'] = mime_type or 'image/jpeg'
-                    
-                    # Upload vers S3
-                    s3_response = requests.put(
-                        upload_url,
-                        data=part_data,
-                        headers=s3_headers
-                    )
-                    
-                    if s3_response.status_code not in [200, 204]:
-                        print(f"❌ Failed to upload part {i}: {s3_response.status_code}")
+                        s3_headers["Content-Type"] = mime_type or "image/jpeg"
+                    s3_response = requests.put(upload_url, data=part_data, headers=s3_headers)
+                    if s3_response.status_code not in (200, 204):
+                        self._fail(f"S3 {upload_type} part {index}: {s3_response.status_code}")
                         return None
-                    
-                    # Récupère l'ETag
-                    etag = s3_response.headers.get('ETag', '').strip('"')
-                    parts.append({
-                        "PartNumber": i,
-                        "ETag": etag
-                    })
-                    
-                    print(f"  ✅ Part {i} uploaded (ETag: {etag[:20]}...)")
-            
-            # Step 3: Complete l'upload
-            print(f"Step 3: Completing upload...")
-            
-            complete_payload = {
-                "parts": parts
-            }
-            
+                    # The app keeps the quotes S3 puts around the ETag.
+                    etag = s3_response.headers.get("ETag", "").strip()
+                    if etag and not (etag.startswith('"') and etag.endswith('"')):
+                        etag = f'"{etag.strip(chr(34))}"'
+                    parts.append({"PartNumber": index, "ETag": etag})
+
+            print(f"Step 3: Completing {upload_type}...")
             complete_response = self.session.post(
                 f"{self.base_url}/v1/uploads/{upload_id}/complete",
-                json=complete_payload
+                json={"parts": parts},
             )
-            
             print(f"Status: {complete_response.status_code}")
-            
-            if complete_response.status_code not in [200, 201]:
-                print(f"❌ Failed to complete upload: {complete_response.text}")
+            if complete_response.status_code not in (200, 201):
+                self._fail(f"Complete {upload_type} {complete_response.status_code}: {complete_response.text[:180]}")
                 return None
-            
             complete_data = complete_response.json()
-            print(f"✅ Upload completed!")
-            
             return {
                 "upload_id": upload_id,
-                "complete_response": complete_data
+                "url": complete_data.get("url"),
+                "complete_response": complete_data,
             }
             
         except Exception as e:
-            print(f"❌ Error: {e}")
+            self._fail(f"Upload {upload_type}: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -269,21 +282,14 @@ class RunwayUploader:
                         }
                     }
             
-            # Extrait le teamId depuis les headers si disponible
-            team_id = None
-            for req in getattr(self, '_captured_requests', []):
-                if 'asTeamId' in req.get('url', ''):
-                    import re
-                    match = re.search(r'asTeamId=(\d+)', req['url'])
-                    if match:
-                        team_id = int(match.group(1))
-                        break
-            
+            team_id = self._apply_team_header()
             payload = {
                 "fileCount": 1,
                 "name": filename,
                 "uploadId": upload_id,
                 "previewUploadIds": preview_upload_ids or [upload_id],
+                "isUserUpload": True,
+                "privateInTeam": True,
                 "metadata": metadata,
                 "type": {
                     "name": "image",
@@ -291,21 +297,22 @@ class RunwayUploader:
                     "isDirectory": False
                 }
             }
-            
-            # Ajoute asTeamId si trouvé
+            params = None
             if team_id:
                 payload["asTeamId"] = team_id
+                params = {"asTeamId": team_id}
                 print(f"  Using Team ID: {team_id}")
-            
+
             response = self.session.post(
                 f"{self.base_url}/v1/datasets",
+                params=params,
                 json=payload
             )
             
             print(f"Status: {response.status_code}")
             
             if response.status_code not in [200, 201]:
-                print(f"❌ Failed to create dataset: {response.text}")
+                self._fail(f"Dataset {response.status_code}: {response.text[:180]}")
                 return None
             
             result = response.json()
@@ -316,7 +323,7 @@ class RunwayUploader:
             return dataset
             
         except Exception as e:
-            print(f"❌ Error: {e}")
+            self._fail(f"Dataset: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -334,12 +341,19 @@ class RunwayUploader:
         """
         print(f"\n🚀 AUTO UPLOAD: {image_path}")
         print("="*80)
-        
-        # Upload multipart
-        result = self.upload_image_multipart(image_path)
-        
+        self.last_error = None
+
+        expired = self.token_error()
+        if expired:
+            self._fail(expired)
+            return None
+
+        # The app uploads the same bytes twice: a preview, then the dataset.
+        preview = self._upload_typed(image_path, "DATASET_PREVIEW")
+        if not preview:
+            return None
+        result = self._upload_typed(image_path, "DATASET")
         if not result:
-            print("\n❌ Upload failed!")
             return None
         
         # Crée le dataset si demandé
@@ -347,11 +361,13 @@ class RunwayUploader:
             dataset = self.create_dataset(
                 upload_id=result['upload_id'],
                 filename=os.path.basename(image_path),
+                preview_upload_ids=[preview["upload_id"]],
                 image_path=image_path
             )
             
-            if dataset:
-                result['dataset'] = dataset
+            if not dataset:
+                return None
+            result['dataset'] = dataset
         
         print("\n" + "="*80)
         print("✅ UPLOAD COMPLETE")

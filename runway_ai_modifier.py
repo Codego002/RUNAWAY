@@ -10,6 +10,181 @@ from typing import Optional, Dict, Any, List
 from runway_uploader import RunwayUploader
 
 
+# Image models captured from the mobile app (session_0001), successful POST /v1/tasks only.
+# credits = cost returned by estimate_feature_cost_credits for 1 image.
+IMAGE_MODELS = [
+    {"id": "gemini_image", "label": "Nano Banana", "family": "gemini", "watermark": True, "credits": 5},
+    {"id": "gemini_3_1_flash_image", "label": "Nano Banana 2", "family": "gemini", "image_size": "1K", "credits": 7},
+    {"id": "gemini_3_pro", "label": "Nano Banana Pro", "family": "gemini", "image_size": "1K", "watermark": True, "credits": 20},
+    {"id": "nano_banana_2_1", "label": "Nano Banana 2.1", "family": "nano", "credits": 4},
+    {"id": "gpt_image_1_mini", "label": "GPT Image 1 Mini", "family": "gpt", "single_ref": True, "credits": 2},
+    {"id": "gpt_image_1_5", "label": "GPT Image 1.5", "family": "gpt", "single_ref": True, "credits": 14},
+    {"id": "ref_image_to_image", "label": "Gen-4", "family": "gen4", "diversity": 2, "credits": 8},
+    {"id": "ref_image_to_image_turbo", "label": "Gen-4 Turbo", "family": "gen4", "credits": 2},
+]
+
+# Gen-4 9:16 and 1:1 come from the capture. 16:9 is the mirror. 4:3 / 3:4 stay on a 16-pixel grid.
+GEN4_SIZES = {
+    "9:16": (1088, 1920),
+    "16:9": (1920, 1088),
+    "1:1": (1088, 1088),
+    "4:3": (1440, 1088),
+    "3:4": (1088, 1440),
+}
+
+# Only 1024x1024 was captured. The other two are the GPT Image portrait/landscape sizes.
+GPT_SIZES = {
+    "1:1": "1024x1024",
+    "4:3": "1536x1024",
+    "16:9": "1536x1024",
+    "3:4": "1024x1536",
+    "9:16": "1024x1536",
+}
+
+
+def model_by_id(task_type: str) -> Dict[str, Any]:
+    for model in IMAGE_MODELS:
+        if model["id"] == task_type:
+            return model
+    return IMAGE_MODELS[0]
+
+
+def model_by_label(label: str) -> Dict[str, Any]:
+    for model in IMAGE_MODELS:
+        if model["label"] == label:
+            return model
+    return model_by_id(label)
+
+
+def build_image_task_payload(
+    prompt: str,
+    reference_images: List[Dict[str, str]],
+    task_type: str = "gemini_image",
+    aspect_ratio: str = "9:16",
+    num_images: int = 1,
+    name: str = None,
+    seed: int = None,
+) -> Dict[str, Any]:
+    """JSON body for POST /v1/tasks, matching the captured mobile app.
+
+    reference_images is an ordered list of {assetId, url}. Tags are assigned
+    IMG_1, IMG_2, ... GPT Image models only accept the first image, as a URL string.
+    """
+    model = model_by_id(task_type)
+    family = model["family"]
+    if not name:
+        name = f"{model['label']} {prompt}"[:80]
+
+    tagged = []
+    for index, image in enumerate(reference_images, start=1):
+        entry = {
+            "assetId": image.get("assetId"),
+            "tag": f"IMG_{index}",
+        }
+        if image.get("url"):
+            entry["url"] = image["url"]
+        tagged.append(entry)
+
+    if family == "gpt":
+        options = {
+            "name": name,
+            "prompt": prompt,
+            "size": GPT_SIZES.get(aspect_ratio, "1024x1024"),
+            "quality": "high",
+            "numImages": num_images,
+            "exploreMode": False,
+            "creationSource": "tool-mode",
+        }
+        if tagged and tagged[0].get("url"):
+            options["referenceImage"] = tagged[0]["url"]
+    elif family == "nano":
+        options = {
+            "name": name,
+            "prompt": prompt,
+            "aspectRatio": aspect_ratio,
+            "resolution": "1k",
+            "numImages": num_images,
+            "referenceImages": tagged,
+            "exploreMode": False,
+            "creationSource": "tool-mode",
+        }
+    elif family == "gen4":
+        width, height = GEN4_SIZES.get(aspect_ratio, GEN4_SIZES["9:16"])
+        options = {
+            "assetGroupName": "Generations",
+            "exploreMode": False,
+            "width": width,
+            "height": height,
+            "text_prompt": prompt,
+            "reference_images": tagged,
+            "name": name,
+            "num_images": num_images,
+        }
+        if model.get("diversity"):
+            options["diversity"] = model["diversity"]
+        if seed is not None:
+            options["seed"] = seed
+    else:
+        options = {
+            "creationSource": "tool-mode",
+            "aspect_ratio": aspect_ratio,
+            "exploreMode": False,
+            "name": name,
+            "num_images": num_images,
+            "text_prompt": prompt,
+            "reference_images": tagged,
+        }
+        if model.get("image_size"):
+            options["image_size"] = model["image_size"]
+        if model.get("watermark"):
+            options["watermark"] = True
+
+    return {
+        "taskType": model["id"],
+        "options": options,
+        "internal": False,
+    }
+
+
+def estimate_task_options(task_type: str, aspect_ratio: str, num_images: int) -> Dict[str, Any]:
+    """Slim options for the credit estimate. Reference images do not change the price."""
+    model = model_by_id(task_type)
+    family = model["family"]
+    if family == "gen4":
+        width, height = GEN4_SIZES.get(aspect_ratio, GEN4_SIZES["9:16"])
+        options = {
+            "width": width,
+            "height": height,
+            "num_images": num_images,
+            "exploreMode": False,
+        }
+        if model.get("diversity"):
+            options["diversity"] = model["diversity"]
+        return options
+    if family == "nano":
+        return {
+            "aspectRatio": aspect_ratio,
+            "resolution": "1k",
+            "numImages": num_images,
+            "exploreMode": False,
+        }
+    if family == "gpt":
+        return {
+            "size": GPT_SIZES.get(aspect_ratio, "1024x1024"),
+            "quality": "high",
+            "numImages": num_images,
+            "exploreMode": False,
+        }
+    options = {
+        "aspect_ratio": aspect_ratio,
+        "num_images": num_images,
+        "exploreMode": False,
+    }
+    if model.get("image_size"):
+        options["image_size"] = model["image_size"]
+    return options
+
+
 class RunwayAIModifier:
     def __init__(self, bearer_token: str = None):
         """
@@ -158,6 +333,7 @@ class RunwayAIModifier:
             if self.team_id:
                 self.uploader.team_id = self.team_id
                 self.session.headers['x-runway-workspace'] = str(self.team_id)
+                self.uploader.session.headers['x-runway-workspace'] = str(self.team_id)
             
             label = account.get("label", f"Account {self.team_id}")
             print(f"✅ Account loaded: {label}")
@@ -188,7 +364,8 @@ class RunwayAIModifier:
         result = self.uploader.auto_upload(image_path, create_dataset=True)
         
         if not result or 'dataset' not in result:
-            print("❌ Upload failed")
+            detail = getattr(self.uploader, "last_error", None) or "Upload failed"
+            print(f"❌ {detail}")
             return None
         
         dataset = result['dataset']
@@ -226,57 +403,25 @@ class RunwayAIModifier:
         """
         print(f"\n🎨 Creating AI task: {prompt}")
         print(f"📋 Task type: {task_type}")
-        
-        if not name:
-            name = prompt[:50]
-        
-        # Calculate width/height from aspect_ratio
-        aspect_map = {
-            "9:16": (1088, 1456),
-            "16:9": (1456, 1088),
-            "1:1": (1088, 1088),
-            "4:3": (1088, 1456),
-            "3:4": (1088, 1456)
-        }
-        width, height = aspect_map.get(aspect_ratio, (1088, 1456))
-        
-        # Build payload based on task type
-        is_gen4 = task_type in ["ref_image_to_image", "ref_image_to_image_turbo"]
-        
-        if is_gen4:
-            # Gen4/Gen4Turbo format (no "workflow_" prefix)
-            payload = {
-                "taskType": task_type,
-                "options": {
-                    "name": name,
-                    "text_prompt": prompt,
-                    "width": width,
-                    "height": height,
-                    "num_images": num_images,
-                    "exploreMode": False,
-                    "reference_images": reference_images,
-                    "flip": True
-                }
-            }
-            
-            # Add seed if provided
-            if seed is not None:
-                payload["options"]["seed"] = seed
-                print(f"🎲 Using seed: {seed}")
-        else:
-            # Gemini format (with "workflow_" prefix)
-            payload = {
-                "taskType": f"workflow_{task_type}",
-                "options": {
-                    "name": name,
-                    "text_prompt": prompt,
-                    "aspect_ratio": aspect_ratio,
-                    "num_images": num_images,
-                    "exploreMode": False,
-                    "reference_images": reference_images
-                }
-            }
-        
+
+        model = model_by_id(task_type)
+        if model.get("single_ref") and len(reference_images) > 1:
+            print(f"⚠️ {model['label']} accepte une seule image, IMG_2+ ignorées")
+        if seed is not None and model["family"] == "gen4":
+            print(f"🎲 Using seed: {seed}")
+        elif model["family"] != "gen4":
+            seed = None
+
+        payload = build_image_task_payload(
+            prompt=prompt,
+            reference_images=reference_images,
+            task_type=model["id"],
+            aspect_ratio=aspect_ratio,
+            num_images=num_images,
+            name=name,
+            seed=seed,
+        )
+
         # Ajoute les IDs si disponibles
         if self.asset_group_id:
             payload["options"]["assetGroupId"] = self.asset_group_id
@@ -319,6 +464,37 @@ class RunwayAIModifier:
             import traceback
             traceback.print_exc()
             return None
+
+    def estimate_feature_cost(
+        self,
+        task_type: str,
+        aspect_ratio: str = "9:16",
+        num_images: int = 1,
+    ) -> Dict[str, Any]:
+        """POST /v1/billing/estimate_feature_cost_credits. Returns the JSON body."""
+        model = model_by_id(task_type)
+        body = {
+            "feature": model["id"],
+            "taskOptions": estimate_task_options(model["id"], aspect_ratio, num_images),
+        }
+        params = None
+        if self.team_id:
+            body["asTeamId"] = self.team_id
+            params = {"asTeamId": self.team_id}
+            self.session.headers["x-runway-workspace"] = str(self.team_id)
+
+        response = self.session.post(
+            f"{self.base_url}/v1/billing/estimate_feature_cost_credits",
+            params=params,
+            json=body,
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"{response.status_code} {response.text[:200]}")
+        data = response.json()
+        if "cost" not in data:
+            raise RuntimeError(str(data)[:200])
+        return data
     
     def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
         """

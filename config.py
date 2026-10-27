@@ -9,8 +9,9 @@ DATA_DIR = Path("data")
 OUTPUTS_DIR = Path("outputs")
 
 # Files
-AUTH_FILE = CAPTURES_DIR / "runway_auth.json"
-CACHE_DB = DATA_DIR / "runway_cache.db"
+AUTH_FILE        = CAPTURES_DIR / "runway_auth.json"
+CACHE_DB         = DATA_DIR / "runway_cache.db"
+PROMPT_HISTORY   = DATA_DIR / "prompt_history.json"
 
 # Create directories
 CAPTURES_DIR.mkdir(exist_ok=True)

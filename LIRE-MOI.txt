@@ -1,0 +1,13 @@
+RUN AWAY2 portable — Runway GUI V2
+
+Installer une fois:
+  pip install -r requirements.txt
+
+LANCER_RUNWAY.bat = Runway ML Batch Processor V2
+Bouton Scanner dans le GUI = capture auth Runway (mitmdump inclus)
+
+iPhone / iPad pour le scanner: proxy HTTP = IP Wi-Fi de CE PC, port 8080
+(pas l'IP Tailscale). Puis Safari http://mitm.it pour le certificat.
+
+Les images generees vont dans outputs\
+Le compte actif est dans data\accounts.json
